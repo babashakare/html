@@ -1,0 +1,179 @@
+name: دانلود سایت و آپلود به گیت هاب
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: '🔗 لینک سایت یا فایل برای دانلود'
+        required: true
+        type: string
+        default: 'https://example.com/'
+      zip_password:
+        description: '🔒 رمز فایل (اختیاری)'
+        required: false
+        type: string
+        default: ''
+      split_size:
+        description: 'حداکثر حجم هر تکه (MB)'
+        required: false
+        type: choice
+        default: '95'
+        options:
+          - '25'
+          - '50'
+          - '95'
+      delete_old_archives:
+        description: 'پاک کردن آرشیوهای قبلی؟'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full wget curl dnsutils tidy
+
+      - name: Fix DNS resolution
+        run: |
+          sudo cp /etc/resolv.conf /etc/resolv.conf.bak
+          echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+          echo "nameserver 8.8.4.4" | sudo tee -a /etc/resolv.conf
+
+      - name: Clean old archives
+        if: ${{ github.event.inputs.delete_old_archives == 'true' }}
+        run: |
+          find . -maxdepth 1 -type f \( -name "*.7z.*" -o -name "*.7z" \) -exec rm -v {} \;
+          find . -maxdepth 1 -type d -name "downloads" -exec rm -rf {} \;
+
+      - name: Setup variables
+        id: vars
+        run: |
+          SIZE=$(echo "${{ github.event.inputs.split_size }}" | grep -oP '\d+')
+          echo "split_mb=${SIZE:-95}" >> $GITHUB_OUTPUT
+          URL="${{ github.event.inputs.target_url }}"
+          URL="${URL%/}"
+          if [[ "$URL" =~ \.(jpg|jpeg|png|gif|pdf|zip|rar|exe|mp4|mp3|iso|dmg|tar|gz|bz2)$ ]]; then
+            echo "type=file" >> $GITHUB_OUTPUT
+          else
+            echo "type=website" >> $GITHUB_OUTPUT
+          fi
+          echo "URL: $URL"
+
+      - name: Download Content
+        id: download
+        run: |
+          URL="${{ github.event.inputs.target_url }}"
+          URL="${URL%/}"
+          mkdir -p source
+
+          if [ "${{ steps.vars.outputs.type }}" == "file" ]; then
+            FILENAME=$(basename "$URL")
+            FILENAME=$(echo "$FILENAME" | cut -d'?' -f1)
+            [ -z "$FILENAME" ] && FILENAME="downloaded_file"
+            curl -L --fail --retry 5 --retry-delay 10 -o "source/$FILENAME" "$URL"
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+
+          else
+            SITE_DOMAIN=$(echo "$URL" | sed 's|https\?://||' | sed 's|/.*||')
+            rm -rf source/*
+
+            wget \
+              --page-requisites \
+              --convert-links \
+              --adjust-extension \
+              --no-host-directories \
+              --restrict-file-names=windows \
+              --span-hosts=false \
+              --level=1 \
+              --domains="$SITE_DOMAIN" \
+              --no-check-certificate \
+              --user-agent="Mozilla/5.0" \
+              "$URL" 2>&1 | tee wget_log.txt
+
+            if [ "$(ls -A source)" ]; then
+              echo "status=success" >> $GITHUB_OUTPUT
+
+              # Beautify HTML
+              find source -name "*.html" -type f -exec tidy -modify -indent --wrap 0 {} \;
+
+              if [ -d "source/$SITE_DOMAIN" ]; then
+                echo "source_folder=$SITE_DOMAIN" >> $GITHUB_OUTPUT
+              else
+                echo "source_folder=." >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "status=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          fi
+
+      - name: Archive and Split
+        id: archive
+        run: |
+          SPLIT_MB=${{ steps.vars.outputs.split_mb }}
+          PASSWORD="${{ github.event.inputs.zip_password }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          OUTPUT_FOLDER="downloads/${TIMESTAMP}"
+          mkdir -p "$OUTPUT_FOLDER"
+
+          if [ "${{ steps.vars.outputs.type }}" == "file" ]; then
+            FILENAME="${{ steps.download.outputs.filename }}"
+            ARCHIVE_NAME="${FILENAME%.*}"
+            INPUT="source/$FILENAME"
+          else
+            SOURCE_DIR="${{ steps.download.outputs.source_folder }}"
+            INPUT="source/$SOURCE_DIR"
+            ARCHIVE_NAME=$(basename "$INPUT")
+          fi
+
+          OUTPUT_ARCHIVE="${OUTPUT_FOLDER}/${ARCHIVE_NAME}.7z"
+
+          if [ -n "$PASSWORD" ]; then
+            7z a -p"$PASSWORD" -mhe=on -mx=3 -v${SPLIT_MB}m "$OUTPUT_ARCHIVE" "$INPUT"
+          else
+            7z a -mx=3 -v${SPLIT_MB}m "$OUTPUT_ARCHIVE" "$INPUT"
+          fi
+
+          rm -rf source
+          echo "folder=$OUTPUT_FOLDER" >> $GITHUB_OUTPUT
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Restore DNS and Configure Git
+        run: |
+          sudo cp /etc/resolv.conf.bak /etc/resolv.conf
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+
+      - name: Commit and Push
+        run: |
+          FOLDER="${{ steps.archive.outputs.folder }}"
+          git add "${FOLDER}/"*.7z*
+          if ! git diff --staged --quiet; then
+            git commit -m "Add archive: ${{ steps.archive.outputs.archive_name }}"
+            git push origin main
+          fi
+
+      - name: Summary
+        run: |
+          FOLDER="${{ steps.archive.outputs.folder }}"
+          TOTAL_SIZE=$(du -sh "$FOLDER" | awk '{print $1}')
+          echo "Archive: ${{ steps.archive.outputs.archive_name }}"
+          echo "Folder: $FOLDER"
+          echo "Size: $TOTAL_SIZE"
