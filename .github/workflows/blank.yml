@@ -99,7 +99,7 @@ jobs:
               --adjust-extension \
               --no-host-directories \
               --restrict-file-names=windows \
-              --span-hosts=false \
+              --span-hosts=off \
               --level=1 \
               --domains="$SITE_DOMAIN" \
               --no-check-certificate \
