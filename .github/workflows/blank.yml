@@ -104,13 +104,12 @@ jobs:
               --domains="$SITE_DOMAIN" \
               --no-check-certificate \
               --user-agent="Mozilla/5.0" \
-              "$URL" 2>&1 | tee wget_log.txt
+              "$URL" 2>&1 | tee wget_log.txt || true
 
             if [ "$(ls -A source)" ]; then
               echo "status=success" >> $GITHUB_OUTPUT
 
-              # Beautify HTML
-              find source -name "*.html" -type f -exec tidy -modify -indent --wrap 0 {} \;
+              find source -name "*.html" -type f -exec tidy -modify -indent --wrap 0 {} \; || true
 
               if [ -d "source/$SITE_DOMAIN" ]; then
                 echo "source_folder=$SITE_DOMAIN" >> $GITHUB_OUTPUT
